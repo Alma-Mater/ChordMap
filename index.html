@@ -72,6 +72,24 @@
 
   /* Piano */
   .piano-wrap { overflow-x: auto; padding: 6px 0; }
+
+  /* Gallery */
+  #galleryGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+  .gcard {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px;
+    cursor: pointer; transition: border-color .12s, transform .12s;
+  }
+  .gcard:hover { border-color: var(--accent-2); transform: translateY(-1px); }
+  .gcard.current { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .gcard .ghead { display:flex; align-items:center; justify-content:space-between; gap:6px; margin-bottom:4px; }
+  .gcard .gname { font-weight: 600; font-size: 14px; }
+  .gcard .gnotes { font-size: 11px; color: var(--muted); margin-top: 4px; min-height: 14px; }
+  .gcard button.gplay {
+    background: transparent; border: 1px solid var(--line); color: var(--text);
+    padding: 2px 8px; font-size: 12px; border-radius: 999px;
+  }
+  .gcard button.gplay:hover { border-color: var(--accent); color: var(--accent); }
+  .gcard svg { width: 100%; height: auto; }
 </style>
 </head>
 <body>
@@ -100,8 +118,8 @@
     <div class="row" style="margin-top:8px;">
       <label class="small">Tone:
         <select id="toneSel">
-          <option value="triangle">Soft (triangle)</option>
-          <option value="sawtooth" selected>Bright (saw)</option>
+          <option value="triangle" selected>Soft (triangle)</option>
+          <option value="sawtooth">Bright (saw)</option>
           <option value="square">Reedy (square)</option>
           <option value="sine">Pure (sine)</option>
         </select>
@@ -156,6 +174,24 @@
     <div class="panel">
       <h2 style="margin-top:0">Chord notes</h2>
       <div id="noteList" class="pillrow"></div>
+    </div>
+
+    <div class="panel">
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
+        <h2 style="margin:0">Compare gallery</h2>
+        <span class="small">Click a card to load it. Tap ▶ to audition without switching.</span>
+        <div style="flex:1"></div>
+        <label class="small">Mode:
+          <select id="galleryMode">
+            <option value="roots">All roots · current quality</option>
+            <option value="qualities" selected>Current root · many qualities</option>
+            <option value="matrix">Matrix (roots × common qualities)</option>
+            <option value="family">Family (current chord + close cousins)</option>
+          </select>
+        </label>
+        <label class="small"><input type="checkbox" id="galleryAuto"/> auto-arpeggiate on hover</label>
+      </div>
+      <div id="galleryGrid"></div>
     </div>
   </section>
 </main>
@@ -355,7 +391,7 @@ const state = {
   instrument: "soprano",
   customMode: false,     // when true, frets/keys come from state.custom
   custom: { soprano: null, baritone: null, piano: null }, // soprano/baritone: int[4] frets or -1; piano: Set of midi
-  tone: "sawtooth",
+  tone: "triangle",
 };
 
 function currentIntervals() {
@@ -379,56 +415,102 @@ function currentChordName() {
 
 /* ---------- Web Audio ---------- */
 let audioCtx = null;
+let masterGain = null;
+let masterComp = null;
 function getCtx() {
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 0.85;
+    masterComp = audioCtx.createDynamicsCompressor();
+    masterComp.threshold.value = -14;
+    masterComp.knee.value = 18;
+    masterComp.ratio.value = 3.5;
+    masterComp.attack.value = 0.005;
+    masterComp.release.value = 0.18;
+    masterGain.connect(masterComp);
+    masterComp.connect(audioCtx.destination);
+  }
   if (audioCtx.state === "suspended") audioCtx.resume();
   return audioCtx;
 }
-function playNote(midi, when, durSec, gain=0.18) {
+
+/* Plucked / struck tone using filtered harmonic stack with exponential decay. */
+function playNote(midi, when, durSec, gain=0.32) {
   const ctx = getCtx();
-  const osc = ctx.createOscillator();
-  const g = ctx.createGain();
-  osc.type = state.tone;
-  osc.frequency.value = midiToFreq(midi);
-  // Slight detune layer for richness
-  const osc2 = ctx.createOscillator();
-  osc2.type = state.tone;
-  osc2.frequency.value = midiToFreq(midi) * 1.003;
-  const g2 = ctx.createGain();
-  // ADSR
-  const a = 0.005, d = 0.12, s = 0.55, r = 0.45;
-  const t0 = when;
+  const freq = midiToFreq(midi);
+  const isPiano = state.instrument === "piano";
+
+  // Pick base waveform by user choice; tame harshness via low-pass filter.
+  const wave = state.tone; // sine | triangle | sawtooth | square
+
+  // Two slightly detuned oscillators for body
+  const o1 = ctx.createOscillator();
+  const o2 = ctx.createOscillator();
+  o1.type = wave;
+  o2.type = wave;
+  o1.frequency.value = freq;
+  o2.frequency.value = freq * 1.0015;
+
+  // Subtle sub-octave sine for warmth (esp. on piano / baritone)
+  const sub = ctx.createOscillator();
+  sub.type = "sine";
+  sub.frequency.value = freq * 0.5;
+  const subGain = ctx.createGain();
+  subGain.gain.value = isPiano ? 0.18 : 0.10;
+
+  // Voice gain
+  const vg = ctx.createGain();
+
+  // Low-pass filter — sweeps down with envelope (pluck-like brightness drop)
+  const filt = ctx.createBiquadFilter();
+  filt.type = "lowpass";
+  filt.Q.value = 0.9;
+  // start bright, fall off
+  const startCut = Math.min(8000, freq * (isPiano ? 8 : 6) + 800);
+  const endCut   = Math.min(3500, freq * (isPiano ? 4 : 3) + 400);
+  filt.frequency.setValueAtTime(startCut, when);
+  filt.frequency.exponentialRampToValueAtTime(endCut, when + Math.max(0.4, durSec * 0.6));
+
+  // ADSR — pluck for fretted, soft hammer for piano
+  const a = 0.004;
+  const peak = gain;
+  const sustain = isPiano ? 0.45 : 0.18;
+  const decayTo = peak * sustain;
+  const decayDur = isPiano ? 0.35 : 0.18;
   const tEnd = when + durSec;
-  g.gain.setValueAtTime(0, t0);
-  g.gain.linearRampToValueAtTime(gain, t0 + a);
-  g.gain.linearRampToValueAtTime(gain * s, t0 + a + d);
-  g.gain.setValueAtTime(gain * s, tEnd);
-  g.gain.linearRampToValueAtTime(0.0001, tEnd + r);
-  g2.gain.setValueAtTime(0,t0);
-  g2.gain.linearRampToValueAtTime(gain*0.5, t0+a);
-  g2.gain.linearRampToValueAtTime(gain*0.3, t0+a+d);
-  g2.gain.setValueAtTime(gain*0.3, tEnd);
-  g2.gain.linearRampToValueAtTime(0.0001, tEnd + r);
-  osc.connect(g); g.connect(ctx.destination);
-  osc2.connect(g2); g2.connect(ctx.destination);
-  osc.start(t0); osc2.start(t0);
-  osc.stop(tEnd + r + 0.05); osc2.stop(tEnd + r + 0.05);
+  const release = isPiano ? 0.7 : 0.55;
+
+  vg.gain.setValueAtTime(0, when);
+  vg.gain.linearRampToValueAtTime(peak, when + a);
+  vg.gain.exponentialRampToValueAtTime(Math.max(0.0001, decayTo), when + a + decayDur);
+  // gentle taper through hold
+  vg.gain.exponentialRampToValueAtTime(Math.max(0.0001, decayTo * 0.55), tEnd);
+  vg.gain.exponentialRampToValueAtTime(0.0001, tEnd + release);
+
+  o1.connect(vg); o2.connect(vg); sub.connect(subGain); subGain.connect(vg);
+  vg.connect(filt);
+  filt.connect(masterGain);
+
+  const stopAt = tEnd + release + 0.05;
+  o1.start(when); o2.start(when); sub.start(when);
+  o1.stop(stopAt); o2.stop(stopAt); sub.stop(stopAt);
 }
 
-function playMidiList(midis, mode="down") {
+function playMidiList(midis, mode="down", opts={}) {
   if (!midis.length) return;
   const ctx = getCtx();
   const t0 = ctx.currentTime + 0.02;
-  const dur = 1.6;
+  const dur = opts.dur ?? 1.8;
+  const gain = opts.gain ?? (state.instrument === "piano" ? 0.22 : 0.28);
   if (mode === "block") {
-    for (const m of midis) playNote(m, t0, dur);
+    for (const m of midis) playNote(m, t0, dur, gain);
     return;
   }
-  // Sort ascending and stagger
   const sorted = [...midis].sort((a,b)=>a-b);
   const order = mode === "down" ? sorted : [...sorted].reverse();
-  const stagger = 0.035;
-  order.forEach((m, i) => playNote(m, t0 + i*stagger, dur));
+  const stagger = state.instrument === "piano" ? 0.012 : 0.028;
+  order.forEach((m, i) => playNote(m, t0 + i*stagger, dur, gain));
 }
 
 function playCurrentChord(mode="down") {
@@ -850,6 +932,287 @@ function renderPiano() {
   return wrap;
 }
 
+/* ---------- Pure chord helpers (used by gallery) ---------- */
+function intervalsFor(quality, altIds) {
+  let ints = QUALITIES[quality].intervals.slice();
+  for (const id of altIds) {
+    const alt = ALTERATIONS.find(a => a.id === id);
+    if (alt) ints = alt.apply(ints);
+  }
+  return ints;
+}
+function pcsFor(rootPc, quality, altIds) {
+  return [...new Set(intervalsFor(quality, altIds).map(i => (rootPc+i)%12))];
+}
+function nameFor(rootPc, quality, altIds) {
+  const altLabels = altIds.map(id => ALTERATIONS.find(a=>a.id===id).label).join("");
+  return `${pcName(rootPc)}${QUALITIES[quality].label}${altLabels}`;
+}
+function midisFor(rootPc, quality, altIds, inst) {
+  const pcs = pcsFor(rootPc, quality, altIds);
+  if (inst === "piano") {
+    const start = 48 + rootPc;
+    const out = [start];
+    let prev = start;
+    const ordered = pcs.filter(p => p !== rootPc).sort((a,b)=>((a-rootPc+12)%12)-((b-rootPc+12)%12));
+    for (const pc of ordered) {
+      let m = prev + ((pc - prev%12 + 12) % 12);
+      if (m === prev) m += 12;
+      out.push(m); prev = m;
+    }
+    return out;
+  }
+  const tuning = INSTRUMENTS[inst].tuning;
+  const v = generateFrettedVoicings(tuning, pcs, rootPc);
+  if (!v.length) return [];
+  return v[0].map((f,i)=> f<0 ? null : tuning[i]+f).filter(x=>x!==null);
+}
+function frettedVoicing(rootPc, quality, altIds, inst) {
+  const pcs = pcsFor(rootPc, quality, altIds);
+  const tuning = INSTRUMENTS[inst].tuning;
+  const v = generateFrettedVoicings(tuning, pcs, rootPc);
+  return v[0] || tuning.map(()=>-1);
+}
+
+/* ---------- Mini SVG renderers for gallery ---------- */
+function miniFretboardSvg(inst, frets, rootPc) {
+  const I = INSTRUMENTS[inst];
+  const tuning = I.tuning;
+  const stringCount = tuning.length;
+  // Determine window: 0-4 if any opens used, else min..min+4
+  const used = frets.filter(f => f > 0);
+  const minF = used.length ? Math.min(...used) : 1;
+  const hasOpen = frets.some(f => f === 0);
+  const startFret = hasOpen ? 0 : Math.max(1, minF);
+  const FRETS = 4;
+  const W = 170, H = 90;
+  const padL = 18, padR = 8, padT = 16, padB = 10;
+  const fbW = W - padL - padR;
+  const fbH = H - padT - padB;
+  const fretW = fbW / FRETS;
+  const stringGap = fbH / (stringCount - 1);
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns,"svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+  // Background
+  const bg = document.createElementNS(ns,"rect");
+  bg.setAttribute("x",padL); bg.setAttribute("y",padT);
+  bg.setAttribute("width",fbW); bg.setAttribute("height",fbH);
+  bg.setAttribute("fill","#262d36"); bg.setAttribute("rx","2");
+  svg.appendChild(bg);
+
+  // Frets
+  for (let f=0; f<=FRETS; f++) {
+    const x = padL + f*fretW;
+    const ln = document.createElementNS(ns,"line");
+    ln.setAttribute("x1",x); ln.setAttribute("x2",x);
+    ln.setAttribute("y1",padT); ln.setAttribute("y2",padT+fbH);
+    ln.setAttribute("stroke", (startFret===0 && f===0) ? "#e6edf3" : "#4a5462");
+    ln.setAttribute("stroke-width", (startFret===0 && f===0) ? 3 : 1);
+    svg.appendChild(ln);
+  }
+  // Strings
+  for (let s=0; s<stringCount; s++) {
+    const y = padT + s*stringGap;
+    const ln = document.createElementNS(ns,"line");
+    ln.setAttribute("x1",padL); ln.setAttribute("x2",padL+fbW);
+    ln.setAttribute("y1",y); ln.setAttribute("y2",y);
+    ln.setAttribute("stroke","#cdd5df"); ln.setAttribute("stroke-width","0.8");
+    svg.appendChild(ln);
+  }
+  // Fret position label
+  if (startFret > 0) {
+    const t = document.createElementNS(ns,"text");
+    t.setAttribute("x", padL - 4); t.setAttribute("y", padT + 8);
+    t.setAttribute("text-anchor","end"); t.setAttribute("font-size","9");
+    t.setAttribute("fill","#8b949e");
+    t.textContent = startFret + "fr";
+    svg.appendChild(t);
+  }
+  // Dots
+  for (let s=0; s<stringCount; s++) {
+    const f = frets[s];
+    if (f === undefined || f < 0) continue;
+    const pc = (tuning[s] + f) % 12;
+    const isRoot = pc === rootPc;
+    const y = padT + s*stringGap;
+    if (f === 0) {
+      const ring = document.createElementNS(ns,"circle");
+      ring.setAttribute("cx", padL - 8); ring.setAttribute("cy", y);
+      ring.setAttribute("r", 4);
+      ring.setAttribute("fill","none");
+      ring.setAttribute("stroke", isRoot ? "var(--root)" : "var(--tone)");
+      ring.setAttribute("stroke-width","1.5");
+      svg.appendChild(ring);
+    } else {
+      const localF = f - startFret + 1;
+      if (localF < 1 || localF > FRETS) continue;
+      const cx = padL + (localF - 0.5) * fretW;
+      const c = document.createElementNS(ns,"circle");
+      c.setAttribute("cx",cx); c.setAttribute("cy",y);
+      c.setAttribute("r", 6);
+      c.setAttribute("fill", isRoot ? "var(--root)" : "var(--tone)");
+      svg.appendChild(c);
+    }
+  }
+  return svg;
+}
+function miniPianoSvg(midis, rootPc) {
+  const sorted = [...midis].sort((a,b)=>a-b);
+  if (!sorted.length) {
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns,"svg");
+    svg.setAttribute("viewBox","0 0 170 60");
+    return svg;
+  }
+  // Window: octave containing lowest note up through highest
+  const lo = Math.floor(sorted[0]/12)*12;
+  const hi = Math.ceil((sorted[sorted.length-1]+1)/12)*12;
+  const isBlack = m => [1,3,6,8,10].includes(m % 12);
+  const whiteKeys = [];
+  for (let m=lo; m<hi; m++) if (!isBlack(m)) whiteKeys.push(m);
+  const wW = 14, wH = 56, bW = 9, bH = 34;
+  const W = whiteKeys.length * wW + 2;
+  const H = wH + 4;
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns,"svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const active = new Set(midis);
+
+  whiteKeys.forEach((m,i)=>{
+    const x = i*wW+1;
+    const r = document.createElementNS(ns,"rect");
+    r.setAttribute("x",x); r.setAttribute("y",2);
+    r.setAttribute("width",wW-1); r.setAttribute("height",wH);
+    r.setAttribute("rx","1.5");
+    const isAct = active.has(m);
+    r.setAttribute("fill", isAct ? (m%12===rootPc ? "#f0b429" : "#58a6ff") : "#f0f6fc");
+    r.setAttribute("stroke","#0e1117"); r.setAttribute("stroke-width","0.5");
+    svg.appendChild(r);
+  });
+  whiteKeys.forEach((m,i)=>{
+    const next = m+1;
+    if (!isBlack(next) || next >= hi) return;
+    const x = (i+1)*wW - bW/2 + 1;
+    const r = document.createElementNS(ns,"rect");
+    r.setAttribute("x",x); r.setAttribute("y",2);
+    r.setAttribute("width",bW); r.setAttribute("height",bH);
+    r.setAttribute("rx","1");
+    const isAct = active.has(next);
+    r.setAttribute("fill", isAct ? (next%12===rootPc ? "#f0b429" : "#58a6ff") : "#0e1117");
+    svg.appendChild(r);
+  });
+  return svg;
+}
+
+/* ---------- Gallery ---------- */
+const COMMON_QUALITIES = ["maj","min","7","maj7","m7","dim","aug","sus2","sus4","6","m6","add9","9","m9","maj9","m7b5","dim7","7sus4","7b9","7#9","7#11","13"];
+
+function buildGalleryEntries(mode) {
+  const out = [];
+  if (mode === "roots") {
+    for (let r=0; r<12; r++) out.push({ rootPc:r, quality: state.quality, alterations: [...state.alterations] });
+  } else if (mode === "qualities") {
+    for (const q of Object.keys(QUALITIES)) out.push({ rootPc: state.rootPc, quality: q, alterations: [] });
+  } else if (mode === "matrix") {
+    for (let r=0; r<12; r++) for (const q of COMMON_QUALITIES) {
+      out.push({ rootPc:r, quality:q, alterations:[] });
+    }
+  } else if (mode === "family") {
+    // current chord plus relatives: same root w/ neighbour qualities + relative minor/major + ii-V-I ish
+    const r = state.rootPc;
+    const fam = new Set();
+    const add = (rp, q, alts=[]) => fam.add(JSON.stringify({rootPc:rp,quality:q,alterations:alts}));
+    add(r, state.quality, [...state.alterations]);
+    // neighbour qualities on same root
+    for (const q of ["maj","min","7","maj7","m7","sus2","sus4","add9","6","m6","dim","aug","9","maj9","m9"]) add(r, q, []);
+    // relative: if maj -> rel min (-3 semitones), if min -> rel maj (+3 semitones)
+    if (state.quality === "maj") add((r+9)%12, "min", []);
+    if (state.quality === "min") add((r+3)%12, "maj", []);
+    // ii-V-I-ish neighbours assuming current root is I major:
+    add((r+5)%12, "maj7", []);     // IV
+    add((r+7)%12, "7", []);        // V
+    add((r+2)%12, "m7", []);       // ii
+    add((r+9)%12, "m7", []);       // vi
+    add((r+4)%12, "m7", []);       // iii
+    for (const s of fam) out.push(JSON.parse(s));
+  }
+  return out;
+}
+
+function renderGallery() {
+  const grid = document.getElementById("galleryGrid");
+  grid.innerHTML = "";
+  const mode = document.getElementById("galleryMode").value;
+  const entries = buildGalleryEntries(mode);
+  const auto = document.getElementById("galleryAuto").checked;
+  const inst = state.instrument;
+
+  for (const e of entries) {
+    const card = document.createElement("div");
+    card.className = "gcard";
+    const isCurrent = !state.customMode &&
+      e.rootPc === state.rootPc &&
+      e.quality === state.quality &&
+      JSON.stringify([...e.alterations].sort()) === JSON.stringify([...state.alterations].sort());
+    if (isCurrent) card.classList.add("current");
+
+    const head = document.createElement("div");
+    head.className = "ghead";
+    const nm = document.createElement("div");
+    nm.className = "gname";
+    nm.textContent = nameFor(e.rootPc, e.quality, e.alterations);
+    const playBtn = document.createElement("button");
+    playBtn.className = "gplay";
+    playBtn.textContent = "\u25B6";
+    playBtn.title = "Play (no switch)";
+    playBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      const ms = midisFor(e.rootPc, e.quality, e.alterations, inst);
+      playMidiList(ms, "down");
+    };
+    head.appendChild(nm); head.appendChild(playBtn);
+    card.appendChild(head);
+
+    // Mini visualization
+    if (inst === "piano") {
+      const ms = midisFor(e.rootPc, e.quality, e.alterations, "piano");
+      card.appendChild(miniPianoSvg(ms, e.rootPc));
+    } else {
+      const v = frettedVoicing(e.rootPc, e.quality, e.alterations, inst);
+      card.appendChild(miniFretboardSvg(inst, v, e.rootPc));
+    }
+
+    const notes = document.createElement("div");
+    notes.className = "gnotes";
+    notes.textContent = pcsFor(e.rootPc, e.quality, e.alterations).map(pcName).join(" \u00b7 ");
+    card.appendChild(notes);
+
+    card.onclick = () => {
+      state.rootPc = e.rootPc;
+      state.quality = e.quality;
+      state.alterations = new Set(e.alterations);
+      state.customMode = false;
+      state.voicingIdx = 0;
+      refreshAll();
+      const ms = midisFor(e.rootPc, e.quality, e.alterations, inst);
+      playMidiList(ms, "down");
+    };
+    if (auto) {
+      let timer = null;
+      card.onmouseenter = () => {
+        timer = setTimeout(() => {
+          const ms = midisFor(e.rootPc, e.quality, e.alterations, inst);
+          playMidiList(ms, "down");
+        }, 180);
+      };
+      card.onmouseleave = () => { if (timer) clearTimeout(timer); };
+    }
+    grid.appendChild(card);
+  }
+}
+
 /* ---------- Refresh / orchestration ---------- */
 function refreshAll() {
   if (!state.customMode) rebuildLibraryVoicings();
@@ -865,6 +1228,7 @@ function refreshAll() {
   } else {
     area.appendChild(renderFretboard(state.instrument));
   }
+  renderGallery();
 }
 
 /* ---------- Saved chords ---------- */
@@ -965,6 +1329,8 @@ document.getElementById("resetCustom").onclick = () => {
   refreshAll();
 };
 document.getElementById("saveBtn").onclick = saveCurrent;
+document.getElementById("galleryMode").onchange = renderGallery;
+document.getElementById("galleryAuto").onchange = renderGallery;
 
 window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
