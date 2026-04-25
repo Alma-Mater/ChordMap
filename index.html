@@ -90,14 +90,49 @@
   }
   .gcard button.gplay:hover { border-color: var(--accent); color: var(--accent); }
   .gcard svg { width: 100%; height: auto; }
+
+  /* Top-level page nav */
+  .pagenav { display: flex; gap: 4px; margin-left: auto; }
+  .pagenav button {
+    background: transparent; color: var(--muted); border: 1px solid transparent;
+    padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer;
+  }
+  .pagenav button.active { color: var(--text); border-color: var(--accent); background: rgba(247,129,102,0.08); }
+  .pagenav button:hover:not(.active) { color: var(--text); border-color: var(--line); }
+
+  /* Circle of Fifths */
+  .circle-page { padding: 18px 22px; overflow-y: auto; }
+  .circle-controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  .circle-stage { display: grid; grid-template-columns: minmax(420px, 1fr) 320px; gap: 22px; align-items: start; }
+  @media (max-width: 980px) { .circle-stage { grid-template-columns: 1fr; } }
+  .circle-svg { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px; }
+  .cof-seg { cursor: pointer; transition: filter .1s, opacity .1s; }
+  .cof-seg:hover { filter: brightness(1.15); }
+  .cof-seg.dim { opacity: 0.35; }
+  .cof-label { pointer-events: none; font-weight: 600; }
+  .cof-info { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .cof-info h3 { margin: 0 0 8px 0; font-size: 18px; }
+  .roman-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 8px; }
+  .roman-cell {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 4px; text-align: center; cursor: pointer;
+    transition: border-color .12s, transform .12s;
+  }
+  .roman-cell:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .roman-cell .rn { color: var(--muted); font-size: 11px; }
+  .roman-cell .rc { font-weight: 600; font-size: 14px; margin-top: 2px; }
 </style>
 </head>
 <body>
 <header>
   <h1>ChordMap</h1>
   <span class="sub">Visual chord explorer for ukulele &amp; piano · click anything to play</span>
+  <div class="pagenav" id="pageNav">
+    <button data-page="explorer" class="active">Explorer</button>
+    <button data-page="circle">Circle of Fifths</button>
+  </div>
 </header>
-<main>
+<main id="explorerPage">
   <aside>
     <h2>Root</h2>
     <div class="row" id="rootRow"></div>
@@ -195,6 +230,46 @@
     </div>
   </section>
 </main>
+
+<div id="circlePage" class="circle-page" style="display:none;">
+  <div class="circle-controls">
+    <label class="small">Key:
+      <select id="cofKey"></select>
+    </label>
+    <label class="small">Mode:
+      <select id="cofMode">
+        <option value="major" selected>Major (Ionian)</option>
+        <option value="minor">Natural minor (Aeolian)</option>
+      </select>
+    </label>
+    <label class="small">Quality:
+      <select id="cofQuality">
+        <option value="diatonic" selected>Diatonic (auto)</option>
+        <option value="maj">Force major triads</option>
+        <option value="min">Force minor triads</option>
+        <option value="7">Force dominant 7</option>
+        <option value="maj7">Force maj7</option>
+        <option value="m7">Force m7</option>
+      </select>
+    </label>
+    <label class="small"><input type="checkbox" id="cofHighlight" checked/> highlight diatonic</label>
+    <label class="small">Instrument:
+      <select id="cofInstrument">
+        <option value="piano" selected>Piano</option>
+        <option value="soprano">Soprano Ukulele</option>
+        <option value="baritone">Baritone Ukulele</option>
+      </select>
+    </label>
+    <div style="flex:1"></div>
+    <button id="cofPlayCadence" class="ghost">▶ I–IV–V–I</button>
+    <button id="cofPlay2516" class="ghost">▶ ii–V–I–vi</button>
+  </div>
+
+  <div class="circle-stage">
+    <div class="circle-svg" id="cofSvgWrap"></div>
+    <div class="cof-info" id="cofInfo"></div>
+  </div>
+</div>
 
 <script>
 /* =========================================================
@@ -1344,9 +1419,255 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
+/* ---------- Circle of Fifths ---------- */
+/* Order around the circle, starting at top (C) going clockwise */
+const COF_MAJOR_ORDER = [0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5]; // C G D A E B F# C# G# D# A# F
+const COF_MAJOR_LABELS = ["C","G","D","A","E","B","F♯/G♭","C♯/D♭","G♯/A♭","D♯/E♭","A♯/B♭","F"];
+const COF_MINOR_LABELS = ["Am","Em","Bm","F♯m","C♯m","G♯m","D♯m/E♭m","A♯m/B♭m","Fm","Cm","Gm","Dm"];
+
+const MAJOR_SCALE = [0,2,4,5,7,9,11];
+const MINOR_SCALE = [0,2,3,5,7,8,10];
+const MAJOR_DIATONIC = ["maj","min","min","maj","maj","min","dim"];
+const MINOR_DIATONIC = ["min","dim","maj","min","min","maj","maj"];
+const ROMAN_MAJOR = ["I","ii","iii","IV","V","vi","vii°"];
+const ROMAN_MINOR = ["i","ii°","♭III","iv","v","♭VI","♭VII"];
+
+const cofState = {
+  keyPc: 0,
+  mode: "major",
+  qualityOverride: "diatonic",
+  highlightDiatonic: true,
+  instrument: "piano",
+};
+
+function diatonicChordAt(keyPc, mode, scaleDeg) {
+  const scale = mode === "major" ? MAJOR_SCALE : MINOR_SCALE;
+  const quals = mode === "major" ? MAJOR_DIATONIC : MINOR_DIATONIC;
+  const root = (keyPc + scale[scaleDeg]) % 12;
+  return { rootPc: root, quality: quals[scaleDeg] };
+}
+
+function diatonicPcSet(keyPc, mode) {
+  const scale = mode === "major" ? MAJOR_SCALE : MINOR_SCALE;
+  return new Set(scale.map(s => (keyPc + s) % 12));
+}
+
+function cofChordForSegment(rootPc, ring) {
+  // ring: 'outer' (major) or 'inner' (minor)
+  const override = cofState.qualityOverride;
+  if (override !== "diatonic") {
+    return { rootPc, quality: override };
+  }
+  // Default ring quality
+  return { rootPc, quality: ring === "outer" ? "maj" : "min" };
+}
+
+function describeRoman(keyPc, mode, rootPc, quality) {
+  const scale = mode === "major" ? MAJOR_SCALE : MINOR_SCALE;
+  const romans = mode === "major" ? ROMAN_MAJOR : ROMAN_MINOR;
+  const deg = scale.indexOf(((rootPc - keyPc) % 12 + 12) % 12);
+  if (deg < 0) return "";
+  return romans[deg];
+}
+
+function renderCircleOfFifths() {
+  const wrap = document.getElementById("cofSvgWrap");
+  wrap.innerHTML = "";
+  const ns = "http://www.w3.org/2000/svg";
+  const W = 560, H = 560;
+  const svg = document.createElementNS(ns,"svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("width","100%");
+  svg.setAttribute("style","max-width:600px; display:block; margin:0 auto;");
+
+  const cx = W/2, cy = H/2;
+  const R_OUTER = 260, R_MID = 190, R_INNER = 120, R_CORE = 60;
+
+  const diatonicSet = diatonicPcSet(cofState.keyPc, cofState.mode);
+  const highlight = cofState.highlightDiatonic;
+
+  // Helper: arc segment path
+  function segPath(r1, r2, a1, a2) {
+    const x1a = cx + r2*Math.cos(a1), y1a = cy + r2*Math.sin(a1);
+    const x2a = cx + r2*Math.cos(a2), y2a = cy + r2*Math.sin(a2);
+    const x1b = cx + r1*Math.cos(a2), y1b = cy + r1*Math.sin(a2);
+    const x2b = cx + r1*Math.cos(a1), y2b = cy + r1*Math.sin(a1);
+    return `M ${x1a} ${y1a} A ${r2} ${r2} 0 0 1 ${x2a} ${y2a} L ${x1b} ${y1b} A ${r1} ${r1} 0 0 0 ${x2b} ${y2b} Z`;
+  }
+
+  const SEGS = 12;
+  const SEG_ANGLE = (Math.PI*2)/SEGS;
+  // Top center alignment: segment 0 centered at -PI/2
+  const startAngle = -Math.PI/2 - SEG_ANGLE/2;
+
+  function drawRing(ringName, r1, r2, labels, ringPositions) {
+    for (let i=0; i<SEGS; i++) {
+      const pos = ringPositions[i];
+      const rootPc = COF_MAJOR_ORDER[i];
+      const a1 = startAngle + i*SEG_ANGLE;
+      const a2 = a1 + SEG_ANGLE;
+      const isInDiatonic = diatonicSet.has(rootPc);
+      const isKey = rootPc === cofState.keyPc &&
+        ((cofState.mode === "major" && ringName === "outer") ||
+         (cofState.mode === "minor" && ringName === "inner"));
+      const seg = document.createElementNS(ns,"path");
+      seg.setAttribute("d", segPath(r1, r2, a1, a2));
+      let fill;
+      if (isKey) fill = "#f78166";
+      else if (highlight && isInDiatonic) fill = ringName === "outer" ? "#2f4a73" : "#3a4250";
+      else fill = ringName === "outer" ? "#1f2630" : "#1a1f27";
+      seg.setAttribute("fill", fill);
+      seg.setAttribute("stroke","#0e1117");
+      seg.setAttribute("stroke-width","2");
+      seg.classList.add("cof-seg");
+      if (highlight && !isInDiatonic && !isKey) seg.classList.add("dim");
+      const chord = cofChordForSegment(rootPc, ringName);
+      seg.onclick = () => {
+        const midis = midisFor(chord.rootPc, chord.quality, [], cofState.instrument);
+        playMidiList(midis, "down");
+        updateCofInfo(chord, ringName);
+      };
+      svg.appendChild(seg);
+
+      // Label
+      const mid = (a1+a2)/2;
+      const labelR = (r1+r2)/2;
+      const lx = cx + labelR*Math.cos(mid);
+      const ly = cy + labelR*Math.sin(mid);
+      const t = document.createElementNS(ns,"text");
+      t.setAttribute("x", lx); t.setAttribute("y", ly+4);
+      t.setAttribute("text-anchor","middle");
+      t.setAttribute("font-size", ringName === "outer" ? "18" : "14");
+      t.setAttribute("fill", isKey ? "#1a1a1a" : "#e6edf3");
+      t.classList.add("cof-label");
+      t.textContent = labels[i];
+      svg.appendChild(t);
+    }
+  }
+
+  drawRing("outer", R_MID, R_OUTER, COF_MAJOR_LABELS, COF_MAJOR_ORDER);
+  drawRing("inner", R_INNER, R_MID, COF_MINOR_LABELS, COF_MAJOR_ORDER);
+
+  // Center label
+  const core = document.createElementNS(ns,"circle");
+  core.setAttribute("cx",cx); core.setAttribute("cy",cy); core.setAttribute("r",R_CORE);
+  core.setAttribute("fill","#0e1117"); core.setAttribute("stroke","#2a323d");
+  svg.appendChild(core);
+  const tk = document.createElementNS(ns,"text");
+  tk.setAttribute("x",cx); tk.setAttribute("y",cy-4);
+  tk.setAttribute("text-anchor","middle"); tk.setAttribute("font-size","20");
+  tk.setAttribute("fill","#f78166"); tk.setAttribute("font-weight","700");
+  tk.textContent = (cofState.mode === "major"
+    ? COF_MAJOR_LABELS[COF_MAJOR_ORDER.indexOf(cofState.keyPc)]
+    : COF_MINOR_LABELS[COF_MAJOR_ORDER.indexOf(cofState.keyPc)]);
+  svg.appendChild(tk);
+  const tk2 = document.createElementNS(ns,"text");
+  tk2.setAttribute("x",cx); tk2.setAttribute("y",cy+14);
+  tk2.setAttribute("text-anchor","middle"); tk2.setAttribute("font-size","11");
+  tk2.setAttribute("fill","#8b949e");
+  tk2.textContent = cofState.mode;
+  svg.appendChild(tk2);
+
+  wrap.appendChild(svg);
+  renderCofInfo();
+}
+
+function updateCofInfo(chord, ringName) {
+  const info = document.getElementById("cofInfo");
+  const roman = describeRoman(cofState.keyPc, cofState.mode, chord.rootPc, chord.quality);
+  const name = nameFor(chord.rootPc, chord.quality, []);
+  const notes = pcsFor(chord.rootPc, chord.quality, []).map(pcName).join(" · ");
+  info.querySelector("#cofLast").innerHTML =
+    `<b>${name}</b>${roman ? ` <span class="small">(${roman} of ${COF_MAJOR_LABELS[COF_MAJOR_ORDER.indexOf(cofState.keyPc)]} ${cofState.mode})</span>` : ""}<br/><span class="small">${notes}</span>`;
+}
+
+function renderCofInfo() {
+  const info = document.getElementById("cofInfo");
+  const keyLabel = cofState.mode === "major"
+    ? COF_MAJOR_LABELS[COF_MAJOR_ORDER.indexOf(cofState.keyPc)]
+    : COF_MINOR_LABELS[COF_MAJOR_ORDER.indexOf(cofState.keyPc)];
+  const romans = cofState.mode === "major" ? ROMAN_MAJOR : ROMAN_MINOR;
+  let cells = "";
+  for (let d=0; d<7; d++) {
+    const ch = diatonicChordAt(cofState.keyPc, cofState.mode, d);
+    const nm = nameFor(ch.rootPc, ch.quality, []);
+    cells += `<div class="roman-cell" data-deg="${d}">
+      <div class="rn">${romans[d]}</div>
+      <div class="rc">${nm}</div>
+    </div>`;
+  }
+  info.innerHTML = `
+    <h3>Key of ${keyLabel}</h3>
+    <div class="small">Click any wedge or chord below to play. Numbers click ▶ to play that diatonic chord.</div>
+    <div class="roman-row">${cells}</div>
+    <hr/>
+    <div class="small" style="margin-bottom:6px;">Last played:</div>
+    <div id="cofLast" class="small">—</div>
+  `;
+  info.querySelectorAll(".roman-cell").forEach(el => {
+    el.onclick = () => {
+      const d = parseInt(el.dataset.deg, 10);
+      const ch = diatonicChordAt(cofState.keyPc, cofState.mode, d);
+      const midis = midisFor(ch.rootPc, ch.quality, [], cofState.instrument);
+      playMidiList(midis, "down");
+      updateCofInfo(ch, "outer");
+    };
+  });
+}
+
+function playProgression(degrees, gapMs=600) {
+  let i = 0;
+  function step() {
+    if (i >= degrees.length) return;
+    const ch = diatonicChordAt(cofState.keyPc, cofState.mode, degrees[i]);
+    const midis = midisFor(ch.rootPc, ch.quality, [], cofState.instrument);
+    playMidiList(midis, "down");
+    updateCofInfo(ch, "outer");
+    i++;
+    setTimeout(step, gapMs);
+  }
+  step();
+}
+
+function initCircleOfFifths() {
+  // Populate key dropdown
+  const sel = document.getElementById("cofKey");
+  sel.innerHTML = "";
+  // Order keys by circle of fifths (looks nicer)
+  for (let i=0; i<12; i++) {
+    const pc = COF_MAJOR_ORDER[i];
+    const o = document.createElement("option");
+    o.value = pc;
+    o.textContent = pcName(pc);
+    sel.appendChild(o);
+  }
+  sel.value = cofState.keyPc;
+  sel.onchange = () => { cofState.keyPc = parseInt(sel.value,10); renderCircleOfFifths(); };
+  document.getElementById("cofMode").onchange = e => { cofState.mode = e.target.value; renderCircleOfFifths(); };
+  document.getElementById("cofQuality").onchange = e => { cofState.qualityOverride = e.target.value; renderCircleOfFifths(); };
+  document.getElementById("cofHighlight").onchange = e => { cofState.highlightDiatonic = e.target.checked; renderCircleOfFifths(); };
+  document.getElementById("cofInstrument").onchange = e => { cofState.instrument = e.target.value; };
+  document.getElementById("cofPlayCadence").onclick = () => playProgression([0,3,4,0]);
+  document.getElementById("cofPlay2516").onclick = () => playProgression([1,4,0,5]);
+}
+
+/* ---------- Page nav ---------- */
+function showPage(page) {
+  document.getElementById("explorerPage").style.display = page === "explorer" ? "" : "none";
+  document.getElementById("circlePage").style.display = page === "circle" ? "" : "none";
+  document.querySelectorAll("#pageNav button").forEach(b => {
+    b.classList.toggle("active", b.dataset.page === page);
+  });
+  if (page === "circle") renderCircleOfFifths();
+}
+document.querySelectorAll("#pageNav button").forEach(b => {
+  b.onclick = () => showPage(b.dataset.page);
+});
+
 /* ---------- Init ---------- */
 refreshAll();
 renderSavedList();
+initCircleOfFifths();
 </script>
 </body>
 </html>
