@@ -160,6 +160,19 @@
         </select>
       </label>
     </div>
+    <div class="row" style="margin-top:8px; align-items:center;">
+      <span class="small">Octave:</span>
+      <button id="octDown" class="ghost" title="Lower one octave">–</button>
+      <span id="octLabel" class="small" style="min-width:40px; text-align:center;">0</span>
+      <button id="octUp" class="ghost" title="Raise one octave">+</button>
+    </div>
+    <div class="row" style="margin-top:8px; align-items:center;">
+      <label class="small" style="display:flex; align-items:center; gap:8px; flex:1;">
+        Sustain:
+        <input type="range" id="sustainSlider" min="30" max="160" value="100" step="5" style="flex:1;"/>
+        <span id="sustainLabel" style="min-width:36px; text-align:right;">1.0×</span>
+      </label>
+    </div>
 
     <h2>Saved chords</h2>
     <div class="row" style="gap:6px;">
@@ -363,9 +376,9 @@ const INSTRUMENTS = {
   },
   piano: {
     name: "Piano",
-    // Display range
-    midiLow: 48,   // C3
-    midiHigh: 84,  // C6
+    // Display range — wide enough to see notes when shifting octaves
+    midiLow: 36,   // C2
+    midiHigh: 96,  // C7
     type: "keyed",
   }
 };
@@ -467,6 +480,8 @@ const state = {
   customMode: false,     // when true, frets/keys come from state.custom
   custom: { soprano: null, baritone: null, piano: null }, // soprano/baritone: int[4] frets or -1; piano: Set of midi
   tone: "triangle",
+  octave: 0,    // semitone-by-12 shift applied to playback (and piano voicing root)
+  sustain: 1.0, // 0.3 short -> 1.6 long
 };
 
 function currentIntervals() {
@@ -498,11 +513,11 @@ function getCtx() {
     masterGain = audioCtx.createGain();
     masterGain.gain.value = 0.85;
     masterComp = audioCtx.createDynamicsCompressor();
-    masterComp.threshold.value = -14;
-    masterComp.knee.value = 18;
-    masterComp.ratio.value = 3.5;
-    masterComp.attack.value = 0.005;
-    masterComp.release.value = 0.18;
+    masterComp.threshold.value = -10;
+    masterComp.knee.value = 12;
+    masterComp.ratio.value = 2.5;
+    masterComp.attack.value = 0.003;
+    masterComp.release.value = 0.08;
     masterGain.connect(masterComp);
     masterComp.connect(audioCtx.destination);
   }
@@ -527,12 +542,12 @@ function playNote(midi, when, durSec, gain=0.32) {
   o1.frequency.value = freq;
   o2.frequency.value = freq * 1.0015;
 
-  // Subtle sub-octave sine for warmth (esp. on piano / baritone)
+  // Sub-octave sine for warmth (lower so it doesn't smear)
   const sub = ctx.createOscillator();
   sub.type = "sine";
   sub.frequency.value = freq * 0.5;
   const subGain = ctx.createGain();
-  subGain.gain.value = isPiano ? 0.18 : 0.10;
+  subGain.gain.value = isPiano ? 0.10 : 0.05;
 
   // Voice gain
   const vg = ctx.createGain();
@@ -547,20 +562,21 @@ function playNote(midi, when, durSec, gain=0.32) {
   filt.frequency.setValueAtTime(startCut, when);
   filt.frequency.exponentialRampToValueAtTime(endCut, when + Math.max(0.4, durSec * 0.6));
 
-  // ADSR — pluck for fretted, soft hammer for piano
+  // ADSR — pluck for fretted, soft hammer for piano. Sustain length scaled by user setting.
+  const susMul = (state.sustain ?? 1.0); // 0.3..1.6
   const a = 0.004;
   const peak = gain;
-  const sustain = isPiano ? 0.45 : 0.18;
+  const sustain = isPiano ? 0.30 : 0.10;
   const decayTo = peak * sustain;
-  const decayDur = isPiano ? 0.35 : 0.18;
-  const tEnd = when + durSec;
-  const release = isPiano ? 0.7 : 0.55;
+  const decayDur = (isPiano ? 0.28 : 0.14) * susMul;
+  const tEnd = when + durSec * susMul;
+  const release = (isPiano ? 0.18 : 0.12) * susMul;
 
   vg.gain.setValueAtTime(0, when);
   vg.gain.linearRampToValueAtTime(peak, when + a);
   vg.gain.exponentialRampToValueAtTime(Math.max(0.0001, decayTo), when + a + decayDur);
-  // gentle taper through hold
-  vg.gain.exponentialRampToValueAtTime(Math.max(0.0001, decayTo * 0.55), tEnd);
+  // taper to silence by tEnd (no long sustained hold)
+  vg.gain.exponentialRampToValueAtTime(Math.max(0.0001, decayTo * 0.25), tEnd);
   vg.gain.exponentialRampToValueAtTime(0.0001, tEnd + release);
 
   o1.connect(vg); o2.connect(vg); sub.connect(subGain); subGain.connect(vg);
@@ -576,7 +592,7 @@ function playMidiList(midis, mode="down", opts={}) {
   if (!midis.length) return;
   const ctx = getCtx();
   const t0 = ctx.currentTime + 0.02;
-  const dur = opts.dur ?? 1.8;
+  const dur = opts.dur ?? (state.instrument === "piano" ? 1.0 : 0.85);
   const gain = opts.gain ?? (state.instrument === "piano" ? 0.22 : 0.28);
   if (mode === "block") {
     for (const m of midis) playNote(m, t0, dur, gain);
@@ -596,32 +612,34 @@ function playCurrentChord(mode="down") {
 /* What MIDI notes are sounding for the active instrument view? */
 function currentMidiNotes() {
   const inst = state.instrument;
+  let out;
   if (inst === "piano") {
     if (state.customMode && state.custom.piano && state.custom.piano.size) {
-      return [...state.custom.piano];
+      out = [...state.custom.piano];
+    } else {
+      // build a pleasant 1-2 octave voicing from chord PCs starting around C4 by default
+      const pcs = currentChordPcs();
+      const rootPc = state.rootPc;
+      const start = 60 + rootPc; // root at C4-ish (raised from C3)
+      out = [start];
+      let prev = start;
+      const ordered = orderTonesAboveRoot(pcs, rootPc);
+      for (const pc of ordered) {
+        let m = prev + ((pc - prev%12 + 12) % 12);
+        if (m === prev) m += 12;
+        out.push(m);
+        prev = m;
+      }
     }
-    // build a pleasant 1-2 octave voicing from chord PCs starting at C4
-    const pcs = currentChordPcs();
-    const rootPc = state.rootPc;
-    const start = 48 + rootPc; // root in 3rd octave
-    const out = [];
-    // root
-    out.push(start);
-    // remaining tones above
-    let prev = start;
-    const ordered = orderTonesAboveRoot(pcs, rootPc);
-    for (const pc of ordered) {
-      let m = prev + ((pc - prev%12 + 12) % 12);
-      if (m === prev) m += 12;
-      out.push(m);
-      prev = m;
-    }
-    return out;
+  } else {
+    // fretted
+    const tuning = INSTRUMENTS[inst].tuning;
+    const frets = activeFretsFor(inst);
+    out = frets.map((f,i)=> f<0 ? null : tuning[i]+f).filter(x=>x!==null);
   }
-  // fretted
-  const tuning = INSTRUMENTS[inst].tuning;
-  const frets = activeFretsFor(inst);
-  return frets.map((f,i)=> f<0 ? null : tuning[i]+f).filter(x=>x!==null);
+  // Apply playback octave shift (clamped to MIDI range)
+  const shift = (state.octave || 0) * 12;
+  return out.map(m => Math.max(0, Math.min(127, m + shift)));
 }
 function orderTonesAboveRoot(pcs, rootPc) {
   return pcs.filter(p => p !== rootPc).sort((a,b)=> ((a-rootPc+12)%12) - ((b-rootPc+12)%12));
@@ -1025,9 +1043,10 @@ function nameFor(rootPc, quality, altIds) {
 }
 function midisFor(rootPc, quality, altIds, inst) {
   const pcs = pcsFor(rootPc, quality, altIds);
+  let out;
   if (inst === "piano") {
-    const start = 48 + rootPc;
-    const out = [start];
+    const start = 60 + rootPc;
+    out = [start];
     let prev = start;
     const ordered = pcs.filter(p => p !== rootPc).sort((a,b)=>((a-rootPc+12)%12)-((b-rootPc+12)%12));
     for (const pc of ordered) {
@@ -1035,12 +1054,14 @@ function midisFor(rootPc, quality, altIds, inst) {
       if (m === prev) m += 12;
       out.push(m); prev = m;
     }
-    return out;
+  } else {
+    const tuning = INSTRUMENTS[inst].tuning;
+    const v = generateFrettedVoicings(tuning, pcs, rootPc);
+    if (!v.length) return [];
+    out = v[0].map((f,i)=> f<0 ? null : tuning[i]+f).filter(x=>x!==null);
   }
-  const tuning = INSTRUMENTS[inst].tuning;
-  const v = generateFrettedVoicings(tuning, pcs, rootPc);
-  if (!v.length) return [];
-  return v[0].map((f,i)=> f<0 ? null : tuning[i]+f).filter(x=>x!==null);
+  const shift = (state.octave || 0) * 12;
+  return out.map(m => Math.max(0, Math.min(127, m + shift)));
 }
 function frettedVoicing(rootPc, quality, altIds, inst) {
   const pcs = pcsFor(rootPc, quality, altIds);
@@ -1406,6 +1427,22 @@ document.getElementById("resetCustom").onclick = () => {
 document.getElementById("saveBtn").onclick = saveCurrent;
 document.getElementById("galleryMode").onchange = renderGallery;
 document.getElementById("galleryAuto").onchange = renderGallery;
+function setOctave(v) {
+  state.octave = Math.max(-3, Math.min(3, v));
+  const lbl = document.getElementById("octLabel");
+  lbl.textContent = (state.octave > 0 ? "+" : "") + state.octave;
+  refreshAll();
+}
+document.getElementById("octDown").onclick = () => setOctave(state.octave - 1);
+document.getElementById("octUp").onclick   = () => setOctave(state.octave + 1);
+(() => {
+  const slider = document.getElementById("sustainSlider");
+  const lbl = document.getElementById("sustainLabel");
+  slider.oninput = () => {
+    state.sustain = parseInt(slider.value, 10) / 100;
+    lbl.textContent = state.sustain.toFixed(2) + "\u00d7";
+  };
+})();
 
 window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
@@ -1416,6 +1453,12 @@ window.addEventListener("keydown", (e) => {
     document.getElementById("nextVoicing").click();
   } else if (e.key === "ArrowLeft") {
     document.getElementById("prevVoicing").click();
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    setOctave(state.octave + 1);
+  } else if (e.key === "ArrowDown") {
+    e.preventDefault();
+    setOctave(state.octave - 1);
   }
 });
 
