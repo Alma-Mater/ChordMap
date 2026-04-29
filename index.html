@@ -144,6 +144,10 @@
     <div class="pillrow" id="altRow"></div>
     <div class="help">Stacks on top of the chosen quality. E.g. <code>7</code> + <code>♭9</code> = 7♭9.</div>
 
+    <h2>Inversion</h2>
+    <div class="pillrow" id="invRow"></div>
+    <div class="help">Which chord tone sits in the bass. Triads have 3 inversions; 7ths have 4; etc.</div>
+
     <h2>Sound</h2>
     <div class="row">
       <button id="playBtn" class="primary">▶ Play (Strum ↓)</button>
@@ -386,8 +390,9 @@ const INSTRUMENTS = {
 /* ---------- Voicing generator for fretted instruments ---------- */
 /* Enumerate fret combos (0..MAX_FRET) per string; require: each note is a chord tone,
    chord PCs all present (or at least the essential ones), span <= 4 across non-open frets,
-   prefer voicings where lowest sounding string is the root. Returns deduped, scored list. */
-function generateFrettedVoicings(tuning, chordPcs, rootPc) {
+   prefer voicings where lowest sounding string matches the desired bass PC. */
+function generateFrettedVoicings(tuning, chordPcs, rootPc, bassPc) {
+  if (bassPc === undefined) bassPc = rootPc;
   const MAX_FRET = 12;
   const SPAN = 4;
   const stringCount = tuning.length;
@@ -431,20 +436,20 @@ function generateFrettedVoicings(tuning, chordPcs, rootPc) {
   }
   rec(0);
 
-  // Score: prefer low position, prefer root in bass (lowest pitch string), more coverage, fewer holes
+  // Score: prefer low position, prefer chosen bass PC in bass, more coverage, fewer holes
   const scored = candidates.map(frets => {
     const pitches = frets.map((f,i)=>tuning[i]+f);
     const lowestIdx = pitches.indexOf(Math.min(...pitches));
-    const bassPc = pitches[lowestIdx] % 12;
+    const actualBassPc = pitches[lowestIdx] % 12;
     const playedPcs = new Set(pitches.map(p=>p%12));
     const coverage = chordPcs.filter(p => playedPcs.has(p)).length;
     const maxFret = Math.max(...frets);
     const minNonZero = Math.min(...frets.filter(f=>f>0).concat([0]));
     let score = 0;
     score += coverage * 10;
-    if (bassPc === rootPc) score += 8;
+    if (actualBassPc === bassPc) score += 14; // strong preference for desired bass
+    else if (actualBassPc === rootPc) score += 3;
     score -= maxFret * 0.5;
-    score -= (frets.filter(f=>f===0).length === 0 ? 0 : 0); // neutral
     return { frets, score, maxFret, minNonZero };
   });
 
@@ -482,6 +487,7 @@ const state = {
   tone: "triangle",
   octave: 0,    // semitone-by-12 shift applied to playback (and piano voicing root)
   sustain: 1.0, // 0.3 short -> 1.6 long
+  inversion: 0, // 0 = root position, 1 = 1st inv (3rd in bass), 2 = 2nd inv (5th in bass), etc.
 };
 
 function currentIntervals() {
@@ -501,6 +507,70 @@ function currentChordName() {
   let label = QUALITIES[state.quality].label;
   const altLabels = [...state.alterations].map(id => ALTERATIONS.find(a=>a.id===id).label).join("");
   return `${pcName(state.rootPc)}${label}${altLabels}`;
+}
+
+/* ---------- Inversion helpers ---------- */
+/* Return the "core" chord-tone PCs in stacked-thirds order (root, 3rd, 5th, 7th [, 9th, 11th, 13th]).
+   These are the tones that participate in inversion. Tensions above the 7th are excluded so a 9 chord
+   still has 4 inversions (root, 3, 5, 7) rather than 5. */
+function chordToneOrder(rootPc, intervals) {
+  const seen = new Set();
+  const out = [];
+  for (const i of intervals) {
+    // Only consider stacked thirds within the first octave + 7th: 0,3,4,6,7,8,10,11
+    const pc = (rootPc + i) % 12;
+    const within = i % 12;
+    const isCore = i <= 11; // root..maj7 region
+    if (!isCore) continue;
+    if (seen.has(pc)) continue;
+    seen.add(pc);
+    out.push(pc);
+  }
+  if (!out.length) out.push(rootPc); // safety
+  return out;
+}
+function tensionPcs(rootPc, intervals, corePcs) {
+  const set = new Set(corePcs);
+  const out = [];
+  for (const i of intervals) {
+    if (i <= 11) continue;
+    const pc = (rootPc + i) % 12;
+    if (!set.has(pc)) { out.push(pc); set.add(pc); }
+  }
+  return out;
+}
+function inversionCount(rootPc, intervals) {
+  return chordToneOrder(rootPc, intervals).length;
+}
+/* Given a desired inversion index, return the bass PC. */
+function bassPcForInversion(rootPc, intervals, inv) {
+  const order = chordToneOrder(rootPc, intervals);
+  return order[Math.max(0, Math.min(order.length-1, inv))];
+}
+/* Build a piano voicing: bass note (chosen by inversion) at startMidi, then remaining
+   chord tones (and tensions) stacked upward in pitch-class order. */
+function buildPianoVoicing(rootPc, intervals, inv, startMidi) {
+  const core = chordToneOrder(rootPc, intervals);
+  const tensions = tensionPcs(rootPc, intervals, core);
+  const k = Math.max(0, Math.min(core.length-1, inv));
+  const bassPc = core[k];
+  // Order: bass, then remaining core tones from k+1..end then 0..k-1, then tensions
+  const remaining = [];
+  for (let i = k+1; i < core.length; i++) remaining.push(core[i]);
+  for (let i = 0;   i < k;            i++) remaining.push(core[i]);
+  for (const t of tensions) remaining.push(t);
+  // Place bass at the closest octave at/above startMidi - 4 (so root inversions sit near startMidi)
+  // Simpler: put bass at startMidi shifted to bassPc.
+  const bass = startMidi + ((bassPc - startMidi%12 + 12) % 12);
+  const out = [bass];
+  let prev = bass;
+  for (const pc of remaining) {
+    let m = prev + ((pc - prev%12 + 12) % 12);
+    if (m === prev) m += 12;
+    out.push(m);
+    prev = m;
+  }
+  return out;
 }
 
 /* ---------- Web Audio ---------- */
@@ -617,19 +687,11 @@ function currentMidiNotes() {
     if (state.customMode && state.custom.piano && state.custom.piano.size) {
       out = [...state.custom.piano];
     } else {
-      // build a pleasant 1-2 octave voicing from chord PCs starting around C4 by default
-      const pcs = currentChordPcs();
-      const rootPc = state.rootPc;
-      const start = 60 + rootPc; // root at C4-ish (raised from C3)
-      out = [start];
-      let prev = start;
-      const ordered = orderTonesAboveRoot(pcs, rootPc);
-      for (const pc of ordered) {
-        let m = prev + ((pc - prev%12 + 12) % 12);
-        if (m === prev) m += 12;
-        out.push(m);
-        prev = m;
-      }
+      const ints = currentIntervals();
+      const bassPc = bassPcForInversion(state.rootPc, ints, state.inversion);
+      const anchor = 60; // C4
+      const bass = anchor + ((bassPc - anchor%12 + 12) % 12);
+      out = buildPianoVoicing(state.rootPc, ints, state.inversion, bass);
     }
   } else {
     // fretted
@@ -658,9 +720,11 @@ const libraryVoicingsCache = new Map(); // instrument -> array of frets[]
 function rebuildLibraryVoicings() {
   libraryVoicingsCache.clear();
   const pcs = currentChordPcs();
+  const ints = currentIntervals();
+  const bassPc = bassPcForInversion(state.rootPc, ints, state.inversion);
   for (const inst of ["soprano","baritone"]) {
     const tuning = INSTRUMENTS[inst].tuning;
-    const v = generateFrettedVoicings(tuning, pcs, state.rootPc);
+    const v = generateFrettedVoicings(tuning, pcs, state.rootPc, bassPc);
     libraryVoicingsCache.set(inst, v);
   }
   if (state.voicingIdx >= (libraryVoicingsCache.get(state.instrument)?.length || 1)) {
@@ -715,6 +779,32 @@ function renderAltRow() {
   }
 }
 
+const INVERSION_LABELS = ["Root","1st","2nd","3rd","4th","5th","6th"];
+const INVERSION_DEGREE_NAME = ["root","3rd","5th","7th","9th","11th","13th"];
+function renderInvRow() {
+  const row = document.getElementById("invRow");
+  row.innerHTML = "";
+  const ints = currentIntervals();
+  const count = inversionCount(state.rootPc, ints);
+  if (state.inversion >= count) state.inversion = 0;
+  for (let i = 0; i < count; i++) {
+    const el = document.createElement("div");
+    el.className = "chip" + (state.inversion === i ? " active" : "");
+    const bassPc = bassPcForInversion(state.rootPc, ints, i);
+    el.textContent = `${INVERSION_LABELS[i]} (${pcName(bassPc)})`;
+    el.title = i === 0
+      ? `Root position — ${pcName(bassPc)} in bass`
+      : `${INVERSION_LABELS[i]} inversion — ${INVERSION_DEGREE_NAME[i]} (${pcName(bassPc)}) in bass`;
+    el.onclick = () => {
+      state.inversion = i;
+      state.customMode = false;
+      state.voicingIdx = 0;
+      refreshAll();
+    };
+    row.appendChild(el);
+  }
+}
+
 function renderTabs() {
   document.querySelectorAll(".tab").forEach(t => {
     t.classList.toggle("active", t.dataset.tab === state.instrument);
@@ -723,12 +813,25 @@ function renderTabs() {
 }
 
 function renderHeader() {
-  document.getElementById("chordName").textContent = state.customMode ? "Custom" : currentChordName();
+  let displayName;
+  if (state.customMode) {
+    displayName = "Custom";
+  } else {
+    displayName = currentChordName();
+    if (state.inversion > 0) {
+      const ints = currentIntervals();
+      const bassPc = bassPcForInversion(state.rootPc, ints, state.inversion);
+      // slash notation, e.g. C/E for C major 1st inversion
+      displayName += "/" + pcName(bassPc);
+    }
+  }
+  document.getElementById("chordName").textContent = displayName;
   const pcs = currentChordPcs();
   const tones = pcs.map(pc => pcName(pc)).join(" · ");
+  const invSuffix = state.inversion > 0 ? `  ·  ${INVERSION_LABELS[state.inversion]} inversion` : "";
   document.getElementById("chordMeta").textContent = state.customMode
     ? "Click frets/keys to edit · " + describeCustomNotes()
-    : `${tones}  ·  ${describeIntervals(currentIntervals())}`;
+    : `${tones}  ·  ${describeIntervals(currentIntervals())}${invSuffix}`;
   const cache = libraryVoicingsCache.get(state.instrument) || [];
   const total = state.customMode ? 1 : Math.max(1, cache.length);
   const idx = state.customMode ? 1 : (state.voicingIdx + 1);
@@ -1041,32 +1144,31 @@ function nameFor(rootPc, quality, altIds) {
   const altLabels = altIds.map(id => ALTERATIONS.find(a=>a.id===id).label).join("");
   return `${pcName(rootPc)}${QUALITIES[quality].label}${altLabels}`;
 }
-function midisFor(rootPc, quality, altIds, inst) {
+function midisFor(rootPc, quality, altIds, inst, inv=0) {
+  const ints = intervalsFor(quality, altIds);
   const pcs = pcsFor(rootPc, quality, altIds);
   let out;
   if (inst === "piano") {
-    const start = 60 + rootPc;
-    out = [start];
-    let prev = start;
-    const ordered = pcs.filter(p => p !== rootPc).sort((a,b)=>((a-rootPc+12)%12)-((b-rootPc+12)%12));
-    for (const pc of ordered) {
-      let m = prev + ((pc - prev%12 + 12) % 12);
-      if (m === prev) m += 12;
-      out.push(m); prev = m;
-    }
+    const bassPc = bassPcForInversion(rootPc, ints, inv);
+    const anchor = 60;
+    const bass = anchor + ((bassPc - anchor%12 + 12) % 12);
+    out = buildPianoVoicing(rootPc, ints, inv, bass);
   } else {
     const tuning = INSTRUMENTS[inst].tuning;
-    const v = generateFrettedVoicings(tuning, pcs, rootPc);
+    const bassPc = bassPcForInversion(rootPc, ints, inv);
+    const v = generateFrettedVoicings(tuning, pcs, rootPc, bassPc);
     if (!v.length) return [];
     out = v[0].map((f,i)=> f<0 ? null : tuning[i]+f).filter(x=>x!==null);
   }
   const shift = (state.octave || 0) * 12;
   return out.map(m => Math.max(0, Math.min(127, m + shift)));
 }
-function frettedVoicing(rootPc, quality, altIds, inst) {
+function frettedVoicing(rootPc, quality, altIds, inst, inv=0) {
+  const ints = intervalsFor(quality, altIds);
   const pcs = pcsFor(rootPc, quality, altIds);
   const tuning = INSTRUMENTS[inst].tuning;
-  const v = generateFrettedVoicings(tuning, pcs, rootPc);
+  const bassPc = bassPcForInversion(rootPc, ints, inv);
+  const v = generateFrettedVoicings(tuning, pcs, rootPc, bassPc);
   return v[0] || tuning.map(()=>-1);
 }
 
@@ -1315,6 +1417,7 @@ function refreshAll() {
   renderRootRow();
   renderQualitySel();
   renderAltRow();
+  renderInvRow();
   renderTabs();
   renderHeader();
   const area = document.getElementById("instrumentArea");
